@@ -1,0 +1,84 @@
+---
+title: "Downloads"
+format: html
+editor: visual
+---
+
+#------------ \# This script downloads STAR and RRPA TCGA data using TCGAbiolinks package #-----------
+
+1.  Query for RRPA data (only tumor)
+2.  Get the same Bulk-RNA seq (STAR counts) data patients (matched)
+
+NOTE: Restricting to only 20 samples for this analysis
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+
+# Query RPPA data
+query_rppa <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Proteome Profiling",
+  data.type = "Protein Expression Quantification",
+)
+
+# Download and prepare RPPA data
+GDCdownload(query_rppa, directory = "GDCdata")
+rppa_data <- GDCprepare(query_rppa, directory = "GDCdata")
+
+# Get available RPPA samples
+rppa_samples <- colnames(rppa_data)
+rppa_patients <- unique(substr(rppa_samples, 1, 12))
+
+# Query RNA-seq for the same patients
+query_rna <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling", 
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type = c("Primary Tumor", "Solid Tissue Normal")
+)
+
+#rna_results from your query_rna
+rna_annot <- rna_results %>% 
+  mutate(
+    patient_id = substr(cases, 1, 12),
+    sample_type = ifelse(grepl("-01[A-Z]$", sample.submitter_id), "Tumor",
+                   ifelse(grepl("-11[A-Z]$", sample.submitter_id), "Normal", NA))
+  ) %>% 
+  filter(!is.na(sample_type))
+
+# keep only RPPA patients and require both Tumor+Normal
+keep_patients <- rna_annot %>% 
+  filter(patient_id %in% rppa_patients) %>% 
+  count(patient_id, sample_type) %>% 
+  pivot_wider(names_from = sample_type, values_from = n, values_fill = 0) %>% 
+  filter(Tumor > 0, Normal > 0) %>% 
+  pull(patient_id)
+
+patients20 <- keep_patients %>% 
+  unique() %>% 
+  sample(size = 10)
+
+rna_20 <- rna_matched %>% 
+  filter(patient_id %in% patients20) %>% 
+  arrange(patient_id, sample_type)
+
+query_rna_20 <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  barcode = rna_20$sample.submitter_id
+)
+
+GDCdownload(query_rna_20, directory = "GDCdata")
+rna_data <- GDCprepare(query_rna_20, directory = "GDCdata")
+
+saveRDS(rna_data, file = "rna_data.rds")
+saveRDS(rppa_data, file = "rppa_data.rds")
+
+
+```

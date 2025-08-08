@@ -1,0 +1,51 @@
+---
+title: "Proteomics_TCGA"
+format: html
+editor: visual
+---
+
+#----- \# This script visualizes protein data from TCGA on tumor samples #------
+
+1.  Prepare matrix
+2.  Expression distribution
+3.  Boxplot
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+rppa_data <- readRDS('../../data/rppa_data.rds')
+rppa_df <- as.data.frame(rppa_data)
+
+# --- 1. Prepare matrix ---
+# Extract only TCGA columns
+tumor_cols <- grep("-01$", colnames(prot_mat))
+prot_mat <- prot_mat[, tumor_cols, drop = FALSE]
+sample_cols <- grep("^TCGA", names(rppa_df))
+prot_mat <- as.matrix(rppa_df[, sample_cols, drop = FALSE])
+rownames(prot_mat) <- rppa_df$peptide_target
+
+```
+
+```{r}
+# --- 2. Basic distribution of expression values ---
+df_long <- as.data.frame(prot_mat) %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(-Protein, names_to = "Sample", values_to = "Expression")
+
+ggplot(df_long, aes(Expression)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of RPPA expression values", x = "Expression", y = "Count")
+```
+
+```{r}
+# --- 3. Boxplot per protein (top variable ones) ---
+var_prot <- apply(prot_mat, 1, var, na.rm = TRUE)
+top_prot <- names(sort(var_prot, decreasing = TRUE))[1:20]
+df_long %>%
+  filter(Protein %in% top_prot) %>%
+  ggplot(aes(x = Protein, y = Expression)) +
+  geom_boxplot(outlier.size = 0.5) +
+  coord_flip() +
+  labs(title = "Top 20 variable proteins across samples")
+```

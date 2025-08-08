@@ -1,0 +1,288 @@
+---
+title: "Proteomics"
+format: html
+editor: visual
+---
+
+#---- Proteomics data preparation -----#
+
+#Step 1: Clean the peptide target values 
+#Step 2: Map peptide targets to gene symbols 
+#Step 3: Collapse duplicate names by mean 
+#Step 4: Keep only tumor samples
+
+NOTE: No need of normalization since the value is already normalized by TCGA
+
+```{r}
+library(dplyr) 
+library(pheatmap) 
+library(ggplot2) 
+library(ggrepel)
+
+rppa_data <- readRDS('rppa_data.rds')
+
+# ---- Proteomics Data Preparation ----
+rppa_df <- as.data.frame(rppa_data)
+sample_cols <- grep("^TCGA", names(rppa_df))
+prot_mat <- as.matrix(rppa_df[, sample_cols, drop = FALSE])
+targets <- rppa_df$peptide_target
+
+# --- clean targets (drop phospho/site suffixes etc.)
+t_clean <- gsub("_p[STY].*$", "", targets, ignore.case = TRUE)
+t_clean <- gsub("\\s+", "", t_clean)                 # remove spaces
+t_clean <- gsub("β", "B", t_clean, ignore.case=TRUE) # greek to latin
+
+# --- manual recode for common RPPA names
+recode <- c(
+  "4EBP1"="EIF4EBP1","ACC"="ACACA","ACC1"="ACACA","AuroraB"="AURKB",
+  "Aurora-B"="AURKB","FOXO3A"="FOXO3","SIRPalpha"="SIRPA","SIRP-alpha"="SIRPA",
+  "AMPKALPHA"="PRKAA1","IMP3"="IGF2BP3"
+)
+t_clean2 <- dplyr::recode(t_clean, !!!recode, .default = t_clean)
+
+# --- map aliases → HGNC symbols (fallback if already symbols)
+m_alias <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(t_clean2),
+                                 keytype = "ALIAS", columns = "SYMBOL") %>% distinct()
+m_sym   <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(t_clean2),
+                                 keytype = "SYMBOL", columns = "SYMBOL") %>% distinct()
+m <- bind_rows(
+  m_sym %>% transmute(key = SYMBOL, SYMBOL),
+  m_alias %>% transmute(key = ALIAS, SYMBOL)
+) %>% filter(!is.na(SYMBOL)) %>% distinct(key, .keep_all = TRUE)
+
+sym <- m$SYMBOL[match(t_clean2, m$key)]
+keep <- !is.na(sym)
+prot_mat <- prot_mat[keep, , drop = FALSE]
+rownames(prot_mat) <- sym[keep]
+
+# collapse duplicates by mean
+prot_sym <- rowsum(prot_mat, group = rownames(prot_mat), reorder = FALSE)
+
+# keep tumor samples only
+tumor_cols <- grep("-01[A-Z]?$", colnames(prot_sym), value = TRUE)
+prot_sym <- prot_sym[, tumor_cols, drop = FALSE]
+
+
+```
+
+#----- Bulk RNA seq data normalization -----# 
+#Step 1: Normalization of the counts (log2-CPM) 
+#Step 2: Map ENSEMBL to Gene Symbols
+
+```{r}
+# --- RNA: counts -> logCPM, ENSEMBL -> SYMBOL, collapse
+rna_data <- readRDS("rna_data.rds")
+rna_counts <- as.matrix(SummarizedExperiment::assay(rna_data))
+rna_logcpm <- cpm(rna_counts, log = TRUE, prior.count = 1)
+ens <- sub("\\.\\d+$","", rownames(rna_logcpm))
+
+
+map <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ens),
+                             keytype = "ENSEMBL", columns = "SYMBOL") %>% 
+  filter(!is.na(SYMBOL)) %>% distinct(ENSEMBL, .keep_all = TRUE)
+rna_sym <- rowsum(rna_logcpm[match(map$ENSEMBL, ens), , drop = FALSE],
+                  group = map$SYMBOL, reorder = FALSE)
+```
+
+#---- Integration of Bulk RNA counts and RRPA ----# 
+#Step 1: Find the common patients and gene symbols in both the data 
+#Step 2: Normalization: Z-score transforms both protein and RNA data (row-wise) 
+#Step 3: Compute gene-wise protein-RNA expression correlations
+
+```{r}
+# --- align by patient, one sample each
+pat_prot <- substr(colnames(prot_sym), 1, 12)
+pat_rna  <- substr(colnames(rna_sym),  1, 12)
+common_pat <- intersect(pat_prot, pat_rna)
+
+
+pick_one <- function(mat){ p <- substr(colnames(mat),1,12); mat[, !duplicated(p), drop=FALSE] }
+prot_c <- pick_one(prot_sym[, pat_prot %in% common_pat, drop=FALSE])
+rna_c  <- pick_one(rna_sym[,  pat_rna  %in% common_pat,  drop=FALSE])
+colnames(prot_c) <- substr(colnames(prot_c),1,12)
+colnames(rna_c)  <- substr(colnames(rna_c),1,12)
+common_pat <- intersect(colnames(prot_c), colnames(rna_c))
+prot_c <- prot_c[, common_pat, drop=FALSE]
+rna_c  <- rna_c[,  common_pat, drop=FALSE]
+
+# --- intersect genes, z-score, correlate
+genes <- intersect(rownames(prot_c), rownames(rna_c))
+z <- function(x) t(scale(t(x)))
+prot_z <- z(prot_c[genes, , drop=FALSE])
+rna_z  <- z(rna_c[genes, , drop=FALSE])
+rho <- sapply(genes, function(g) suppressWarnings(cor(prot_z[g,], rna_z[g,], method="spearman",
+                                                      use="pairwise.complete.obs")))
+cor_df <- data.frame(Gene=genes, rho=as.numeric(rho)) %>% arrange(desc(rho))
+write.csv(cor_df, "protein_rna_correlations.csv", row.names = FALSE)
+
+```
+
+# ---- Visualization -----
+
+-   Heatmap : Highlights top 30 most/least concordant/discordant genes between protein and RNA expression
+
+Color scale (red/blue) – Z-scored protein abundance: Red → higher than the average protein abundance for that protein. Blue → lower than the average. White/yellow → close to average.
+
+-   Correlation
+-   Top correlated genes
+-   Integrate this with DEG analysis
+
+```{r}
+#-------
+#--- HEATMAPS
+#----------
+
+# protein z-scores for concordant set)
+# Top discordant
+pheatmap(
+  prot_z[head(cor_df$Gene, 30), ],
+  main = "Top concordant proteins",
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  fontsize_col = 8,
+  angle_col = 45
+)
+
+# Top discordant
+N <- 30
+disc_genes <- cor_df %>%
+  arrange(rho) %>%
+  slice(1:N) %>%
+  pull(Gene)
+
+pheatmap(
+  prot_z[disc_genes, ],
+  main = "Top discordant proteins",
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  fontsize_col = 8,
+  angle_col = 45
+)
+
+png("heatmap_concordant.png", width = 1400, height = 1000, res = 150)
+pheatmap( prot_z[disc_genes, ], show_rownames = TRUE,
+         fontsize_row = 10, fontsize_col = 8, angle_col = 45,
+         main = "Top discordant proteins")
+dev.off()
+#-------- 
+#----- CORRELATION DISTRUBUTION ---
+#------
+
+ggplot(cor_df, aes(rho)) +
+  geom_histogram(bins = 40) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(title = "Protein↔RNA correlation distribution", x = "Spearman rho", y = "Count")
+
+
+#--------
+#---- TOP|rho|
+#--------
+
+cor_df %>%
+  mutate(abs_rho = abs(rho)) %>%
+  slice_max(abs_rho, n = 25) %>%
+  mutate(Gene = reorder(Gene, rho)) %>%
+  ggplot(aes(x = Gene, y = rho)) +
+  geom_segment(aes(xend = Gene, y = 0, yend = rho)) +
+  geom_point() +
+  coord_flip() +
+  labs(title = "Top |rho| genes", y = "rho", x = "")
+
+
+#-----
+# -- INTEGRATION WITH DGE ANALYSIS---
+#-----
+# --- map DEG (ENSEMBL) -> SYMBOL, annotate correlations
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+
+
+DEG_result <- read.csv("../../data/DGE_result.csv", stringsAsFactors = FALSE, row.names = 1)
+
+# 2) Prep IDs
+deg <- DEG_result %>%
+  tibble::rownames_to_column("ENSEMBL") %>%
+  mutate(ENSEMBL_clean = sub("\\.\\d+$", "", ENSEMBL))
+
+# 3) Sanity check key type
+head(deg$ENSEMBL_clean)
+sum(deg$ENSEMBL_clean %in% keys(org.Hs.eg.db, keytype = "ENSEMBL"))
+
+# 4) Map to SYMBOL
+deg_sym <- bitr(deg$ENSEMBL_clean, fromType = "ENSEMBL", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+
+deg2 <- deg %>%
+  left_join(deg_sym, by = c("ENSEMBL_clean" = "ENSEMBL")) %>%
+  filter(!is.na(SYMBOL))
+
+cor_annot <- cor_df %>%
+  as_tibble() %>%
+  left_join(
+    deg2 %>% as_tibble() %>%
+      dplyr::select(SYMBOL, type, adj.P.Val, logFC),
+    by = c("Gene" = "SYMBOL")
+  ) %>%
+  arrange(desc(rho))
+
+# --- GO on intersected DEGs only (using SYMBOL -> ENTREZ)
+deg_up_int   <- cor_annot %>% filter(type=="Up")   %>% pull(Gene) %>% unique()
+deg_down_int <- cor_annot %>% filter(type=="Down") %>% pull(Gene) %>% unique()
+
+up_entrez <- bitr(deg_up_int,   fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+down_entrez <- bitr(deg_down_int, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+
+Go_BP_up <- enrichGO(gene=up_entrez$ENTREZID, OrgDb=org.Hs.eg.db, ont="BP",
+                     pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.05)
+Go_BP_down <- enrichGO(gene=down_entrez$ENTREZID, OrgDb=org.Hs.eg.db, ont="BP",
+                       pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.05)
+
+dotplot(Go_BP_up, title="Upregulated (intersected) - Biological Processes")
+dotplot(Go_BP_down, title="Downregulated (intersected) - Biological Processes")
+
+#----- LOLLIPOP plot with DGE 
+
+#--- log2FC with point color by protein expression
+# mean protein z-score per gene (across aligned patients)
+pm <- rowMeans(prot_z[unique(top_abs$Gene), , drop = FALSE], na.rm = TRUE) 
+pm_df <- tibble::tibble(Gene = names(pm), prot_mean = as.numeric(pm))
+
+top_abs2 <- top_abs %>%
+  left_join(pm_df, by = "Gene")
+
+ggplot(top_abs2, aes(x = logFC, y = reorder(Gene, logFC), fill = prot_mean)) +
+  geom_segment(aes(x = 0, xend = logFC, y = Gene, yend = Gene), color = "grey60") +
+  geom_point(shape = 21, size = 3, stroke = 0.2) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+                       name = "Protein z") +
+  labs(x = "log2 fold change", y = NULL,
+       title = paste0("Top ", N, " |log2FC| genes"),
+       subtitle = "Fill = mean protein z-score") +
+  facet_wrap(~type, scales = "free_y") +
+  theme_bw()
+
+#--- log2FC with point color by rho
+N <- 20
+
+top_abs <- cor_annot %>% 
+  as_tibble() %>% 
+  filter(!is.na(logFC), type %in% c("Up","Down")) %>% 
+  mutate(abs_logFC = abs(logFC)) %>% 
+  group_by(type) %>% 
+  slice_max(abs_logFC, n = N, with_ties = FALSE) %>% 
+  ungroup()
+
+
+ggplot(top_abs, aes(x = logFC, y = reorder(Gene, logFC), color = rho)) +
+  geom_segment(aes(x = 0, xend = logFC, y = Gene, yend = Gene)) +
+  geom_point(size = 2) +
+  scale_color_gradient2(low = "#546de5", mid = "grey70", high = "#ff4757", midpoint = 0) +
+  labs(x = "log2 fold change", y = NULL, color = "Spearman rho",
+       title = paste0("Top ", N, " |log2FC| genes (colored by rho)")) +
+  facet_wrap(~type, scales = "free_y") +
+  theme_bw()
+
+
+```
